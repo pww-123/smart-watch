@@ -2,7 +2,7 @@ menu "Example Configuration"
 
     choice EXAMPLE_LCD_CONTROLLER
         prompt "LCD controller model"
-        default EXAMPLE_LCD_CONTROLLER_ILI9341
+        default EXAMPLE_LCD_CONTROLLER_GC9A01
         help
             Select LCD controller model
 

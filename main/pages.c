@@ -6,6 +6,7 @@
 #include "button.h"
 #include "watch_face.h"
 #include "info_page.h"
+#include "backlight.h"
 
 #include "esp_log.h"
 
@@ -16,6 +17,7 @@ static const char *TAG = "pages";
 
 static lv_obj_t *s_pages[PAGE_COUNT];
 static int s_current = 0;
+static bool s_sleeping = false;
 
 static lv_obj_t *make_page(lv_obj_t *scr)
 {
@@ -47,6 +49,37 @@ static void show_page(int idx)
     ESP_LOGI(TAG, "切换到页面 %d", s_current);
 }
 
+/* 息屏：关背光 + 暂停页面刷新，走时照常（esp_timer 不暂停） */
+static void enter_sleep(void)
+{
+    if (s_sleeping) {
+        return;
+    }
+    s_sleeping = true;
+
+    /* 先暂停刷新，再关背光，避免关灯瞬间残留一帧重绘 */
+    watch_face_set_active(false);
+    info_page_set_active(false);
+    backlight_off();
+
+    ESP_LOGI(TAG, "息屏（走时保持）");
+}
+
+/* 唤醒：开背光 + 恢复当前页刷新 */
+static void exit_sleep(void)
+{
+    if (!s_sleeping) {
+        return;
+    }
+    s_sleeping = false;
+
+    backlight_on();
+    watch_face_set_active(s_current == 0);
+    info_page_set_active(s_current == 1);
+
+    ESP_LOGI(TAG, "唤醒");
+}
+
 static void poll_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -54,11 +87,14 @@ static void poll_cb(lv_timer_t *timer)
     button_evt_t evt = button_poll_event();
     switch (evt) {
     case BUTTON_EVT_SHORT:
-        show_page((s_current + 1) % PAGE_COUNT);
+        if (s_sleeping) {
+            exit_sleep();
+        } else {
+            show_page((s_current + 1) % PAGE_COUNT);
+        }
         break;
     case BUTTON_EVT_LONG:
-        /* 息屏 / 深度睡眠在下一个提交实现 */
-        ESP_LOGI(TAG, "检测到长按（息屏功能待接入）");
+        enter_sleep();
         break;
     default:
         break;

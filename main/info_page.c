@@ -3,6 +3,7 @@
  */
 
 #include "info_page.h"
+#include "board.h"
 
 #include <stdio.h>
 
@@ -68,8 +69,16 @@ void info_page_create(lv_obj_t *parent)
 
     s_label_uptime = add_row(parent, "UPTIME", "00:00:00", 78);
 
-    add_row(parent, "DISPLAY", "GC9A01 240x240", 122);
-    add_row(parent, "SPI CLOCK", "5 MHz", 166);
+    /* 屏幕型号与时钟从 board.h 读取，避免信息页与实际硬件脱节 */
+    char display_buf[24];
+    snprintf(display_buf, sizeof(display_buf), "GC9A01 %dx%d",
+             BOARD_LCD_H_RES, BOARD_LCD_V_RES);
+    add_row(parent, "DISPLAY", display_buf, 122);
+
+    char clk_buf[24];
+    snprintf(clk_buf, sizeof(clk_buf), "%d MHz",
+             BOARD_LCD_PIXEL_CLOCK_HZ / 1000000);
+    add_row(parent, "SPI CLOCK", clk_buf, 166);
 
     lv_obj_t *hint = lv_label_create(parent);
     lv_label_set_text(hint, "BOOT: short=page  long=off");
