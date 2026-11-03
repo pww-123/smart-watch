@@ -10,9 +10,12 @@
 #include "lvgl.h"
 
 /**
- * 在当前活动屏幕上创建表盘，并启动刷新定时器。
+ * 在指定容器上创建表盘，并启动刷新定时器。
  * 必须在 LVGL 初始化之后、持有 LVGL 互斥锁的情况下调用。
  */
-void watch_face_create(lv_disp_t *disp);
+void watch_face_create(lv_obj_t *parent);
+
+/** 页面隐藏时暂停刷新定时器，避免后台无意义重绘 */
+void watch_face_set_active(bool active);
 
 #endif /* WATCH_FACE_H */

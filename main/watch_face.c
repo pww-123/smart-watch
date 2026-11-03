@@ -42,6 +42,8 @@ static lv_obj_t *s_hand_hour;
 static lv_obj_t *s_hand_min;
 static lv_obj_t *s_hand_sec;
 static lv_obj_t *s_label_date;
+static lv_timer_t *s_timer;
+static bool s_active = true;
 
 static lv_point_t s_pts_hour[2];
 static lv_point_t s_pts_min[2];
@@ -108,17 +110,20 @@ static void init_styles(void)
 
 static void create_ticks(lv_obj_t *parent)
 {
+    /* lv_line_set_points 只保存指针、不拷贝数组，点数组必须长期有效，
+       因此每根刻度都需要自己的静态存储，不能放在循环内的局部变量里 */
+    static lv_point_t tick_pts[60][2];
+
     for (int i = 0; i < 60; i++) {
         bool major = (i % 5 == 0);
         float angle = i * 6.0f;
         float len = major ? TICK_LEN_MAJOR : TICK_LEN_MINOR;
 
-        lv_point_t pts[2];
-        polar(angle, DIAL_RADIUS, &pts[0]);
-        polar(angle, DIAL_RADIUS - len, &pts[1]);
+        polar(angle, DIAL_RADIUS, &tick_pts[i][0]);
+        polar(angle, DIAL_RADIUS - len, &tick_pts[i][1]);
 
         lv_obj_t *tick = lv_line_create(parent);
-        lv_line_set_points(tick, pts, 2);
+        lv_line_set_points(tick, tick_pts[i], 2);
         lv_obj_add_style(tick, major ? &s_style_tick_major : &s_style_tick_minor, 0);
     }
 }
@@ -178,6 +183,9 @@ static void update_date_label(int wday, int day)
 static void refresh_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (!s_active) {
+        return;
+    }
 
     clock_time_t now;
     clock_get(&now);
@@ -193,12 +201,11 @@ static void refresh_cb(lv_timer_t *timer)
     update_date_label(now.wday, now.day);
 }
 
-void watch_face_create(lv_disp_t *disp)
+void watch_face_create(lv_obj_t *parent)
 {
-    (void)disp;
-
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *scr = parent;
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0B0E12), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
     init_styles();
     create_ticks(scr);
@@ -220,8 +227,23 @@ void watch_face_create(lv_disp_t *disp)
 
     create_center_dot(scr);
 
+    s_active = true;
     refresh_cb(NULL);
-    lv_timer_create(refresh_cb, REFRESH_PERIOD_MS, NULL);
+    s_timer = lv_timer_create(refresh_cb, REFRESH_PERIOD_MS, NULL);
 
     ESP_LOGI(TAG, "表盘已创建，刷新周期 %d ms", REFRESH_PERIOD_MS);
+}
+
+void watch_face_set_active(bool active)
+{
+    s_active = active;
+    if (s_timer == NULL) {
+        return;
+    }
+    if (active) {
+        lv_timer_resume(s_timer);
+        refresh_cb(NULL);   /* 切回时立刻刷新一次，避免显示旧指针位置 */
+    } else {
+        lv_timer_pause(s_timer);
+    }
 }

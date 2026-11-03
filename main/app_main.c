@@ -5,9 +5,12 @@
  */
 
 #include <stdio.h>
+#include <string.h>
+#include <assert.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -18,7 +21,8 @@
 #include "esp_log.h"
 #include "lvgl.h"
 #include "clock.h"
-#include "watch_face.h"
+#include "pages.h"
+#include "button.h"
 
 #if CONFIG_EXAMPLE_LCD_CONTROLLER_ILI9341
 #include "esp_lcd_ili9341.h"
@@ -38,8 +42,23 @@ static const char *TAG = "example";
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////// Please update the following configuration according to your LCD spec //////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 杜邦线较长时 20MHz 会在屏幕左边缘产生误码竖纹，降到 10MHz 先保证画面干净
 #define EXAMPLE_LCD_PIXEL_CLOCK_HZ     (5 * 1000 * 1000)
+
+/*
+ * 左边缘竖纹诊断：
+ * 降 pclk 到 5MHz 后竖纹仍在，已排除 SPI 信号完整性问题。
+ * gc9a01 驱动的 mirror() 只改 MADCTL 的 MX 位、不改 CASET 列窗口，
+ * 因此物理左边缘对应显存中最后一列；该列若上电后从未被写入，
+ * GRAM 随机内容就会表现为一条固定竖带。
+ * 1 = 开机时把整块 GRAM 写黑（默认开）；置 0 可复现原现象做对比。
+ */
+#define PANEL_CLEAR_GRAM_ON_BOOT       1
+
+/* 改成 0 可让竖纹换到另一侧，用于确认是否属于列映射边界问题 */
+#define PANEL_MIRROR_X                 1
+
+/* 板载 BOOT 键。绝大多数 S3 核心板接 GPIO0，按下为低电平 */
+#define BOOT_BUTTON_GPIO               0
 #define EXAMPLE_LCD_BK_LIGHT_ON_LEVEL  1
 #define EXAMPLE_LCD_BK_LIGHT_OFF_LEVEL !EXAMPLE_LCD_BK_LIGHT_ON_LEVEL
 // 智能手表实际接线（ESP32-S3-N16R8 + 1.28" GC9A01 圆屏）
@@ -67,10 +86,20 @@ static const char *TAG = "example";
 #define EXAMPLE_LVGL_TICK_PERIOD_MS    2
 #define EXAMPLE_LVGL_TASK_MAX_DELAY_MS 500
 #define EXAMPLE_LVGL_TASK_MIN_DELAY_MS 1
-#define EXAMPLE_LVGL_TASK_STACK_SIZE   (4 * 1024)
+/* 两页 90+ 个对象 + 线条/文字绘制，4KB 栈在刷新时容易溢出，提到 8KB */
+#define EXAMPLE_LVGL_TASK_STACK_SIZE   (8 * 1024)
 #define EXAMPLE_LVGL_TASK_PRIORITY     2
 
 static SemaphoreHandle_t lvgl_mux = NULL;
+
+/*
+ * 修复 StoreProhibited 崩溃（2026-11-03）：
+ * SPI 的 on_color_trans_done 回调在 esp_lcd_panel_init 发送初始化命令时就会被触发，
+ * 而此时 lv_disp_drv 尚未初始化（lv_disp_drv_init 在更后面才调用）。
+ * 回调里 lv_disp_flush_ready(&disp_drv) 访问未初始化的结构体，导致向 0x10 写入崩溃。
+ * 用标志位保证：只有当 LVGL 显示驱动注册完成后，才允许回调通知 flush 完成。
+ */
+static bool s_disp_drv_ready = false;
 
 #if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
 esp_lcd_touch_handle_t tp = NULL;
@@ -80,7 +109,10 @@ esp_lcd_touch_handle_t tp = NULL;
 static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
-    lv_disp_flush_ready(disp_driver);
+    /* LVGL 显示驱动未注册完成前，忽略 SPI 传输完成回调（面板初始化命令也会触发它） */
+    if (s_disp_drv_ready) {
+        lv_disp_flush_ready(disp_driver);
+    }
     return false;
 }
 
@@ -104,7 +136,7 @@ static void example_lvgl_port_update_callback(lv_disp_drv_t *drv)
     case LV_DISP_ROT_NONE:
         // Rotate LCD display
         esp_lcd_panel_swap_xy(panel_handle, false);
-        esp_lcd_panel_mirror(panel_handle, true, false);
+        esp_lcd_panel_mirror(panel_handle, PANEL_MIRROR_X, false);
 #if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
         // Rotate LCD touch
         esp_lcd_touch_set_mirror_y(tp, false);
@@ -206,6 +238,29 @@ static void example_lvgl_port_task(void *arg)
     }
 }
 
+/**
+ * 上电后把整块 GRAM 写黑。LVGL 只重绘脏矩形，未被触及的列会一直保留
+ * 上电时的随机内容；全屏清零可消除这类固定竖带，也让开机有一帧干净底色。
+ */
+static void panel_clear_gram(esp_lcd_panel_handle_t panel)
+{
+    const int lines = 20;
+    const size_t bytes = EXAMPLE_LCD_H_RES * lines * sizeof(uint16_t);
+    uint16_t *buf = heap_caps_malloc(bytes, MALLOC_CAP_DMA);
+    assert(buf);
+    memset(buf, 0, bytes);
+
+    for (int y = 0; y < EXAMPLE_LCD_V_RES; y += lines) {
+        int h = lines;
+        if (y + h > EXAMPLE_LCD_V_RES) {
+            h = EXAMPLE_LCD_V_RES - y;
+        }
+        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, y, EXAMPLE_LCD_H_RES, y + h, buf));
+    }
+    free(buf);
+    ESP_LOGI(TAG, "GRAM 全屏清零完成 (%dx%d)", EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+}
+
 void app_main(void)
 {
     static lv_disp_draw_buf_t disp_buf; // contains internal graphic buffer(s) called draw buffer(s)
@@ -266,10 +321,14 @@ void app_main(void)
 #if CONFIG_EXAMPLE_LCD_CONTROLLER_GC9A01
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
 #endif
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, PANEL_MIRROR_X, false));
 
     // user can flush pre-defined pattern to the screen before we turn on the screen or backlight
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+#if PANEL_CLEAR_GRAM_ON_BOOT
+    panel_clear_gram(panel_handle);
+#endif
 
 #if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
@@ -319,6 +378,9 @@ void app_main(void)
     disp_drv.user_data = panel_handle;
     lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
 
+    /* 显示驱动已注册，此后 SPI 传输完成回调才允许通知 LVGL flush 完成 */
+    s_disp_drv_ready = true;
+
     ESP_LOGI(TAG, "Install LVGL tick timer");
     // Tick interface for LVGL (using esp_timer to generate 2ms periodic event)
     const esp_timer_create_args_t lvgl_tick_timer_args = {
@@ -345,11 +407,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Create LVGL task");
     xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
 
-    ESP_LOGI(TAG, "Show analog watch face");
+    ESP_LOGI(TAG, "Create watch UI pages");
     // Lock the mutex due to the LVGL APIs are not thread-safe
     if (example_lvgl_lock(-1)) {
-        watch_face_create(disp);
+        pages_init(disp);
         // Release the mutex
         example_lvgl_unlock();
     }
+
+    /* 按键扫描用 esp_timer，不占用额外 FreeRTOS 任务 */
+    button_init(BOOT_BUTTON_GPIO);
 }

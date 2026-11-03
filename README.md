@@ -3,7 +3,8 @@
 从零开始做一块能戴在手上的智能手表：ESP32-S3-N16R8 + 1.28 寸圆形 GC9A01 TFT，
 用 ESP-IDF v5.3 + LVGL 8.3 从驱动层一路写到 UI 层。
 
-当前进度：**指针式模拟表盘已完成并跑通**（时/分/秒指针 + 1~12 数字刻度 + 星期日期）。
+当前进度：**双页面 UI 已跑通**。指针式模拟表盘（时/分/秒 + 1~12 数字刻度 + 星期日期）
+与系统信息页，短按板载 BOOT 键切换，隐藏页面自动暂停刷新。
 
 <!-- TODO: 把演示 gif 放到 docs/demo.gif，然后取消下面这行的注释 -->
 <!-- ![demo](docs/demo.gif) -->
@@ -63,24 +64,38 @@ idf.py -p COM9 flash monitor
 ```
 
 用 VSCode 的话装 ESP-IDF 插件，打开文件夹后点底部状态栏的火焰图标即可。
-构建产物约 449 KB。
+构建产物约 452 KB。
 
 成功标志：圆屏出现会走动的模拟表盘，串口打印
 
 ```
 I (xxx) clock: 时钟起点: 2026-11-01 20:30:00
-I (xxx) example: Show analog watch face
+I (xxx) example: Create watch UI pages
 I (xxx) watch_face: 表盘已创建，刷新周期 1000 ms
+I (xxx) button: 按键已启用: GPIO0, 扫描 20 ms, 长按阈值 1000 ms
 ```
+
+### 交互
+
+| 操作 | 结果 |
+|---|---|
+| 短按 BOOT（GPIO0） | 表盘页 ⇄ 系统信息页 |
+| 长按 BOOT | 预留给息屏 / 深度睡眠（下一阶段） |
+
+信息页显示运行时长、屏幕型号、SPI 时钟。按键用 20ms 定时扫描 + 状态机消抖，
+事件由 LVGL 定时器在 UI 任务内消费，**不创建额外 FreeRTOS 任务**。
 
 ## 项目结构
 
 ```
 smart-watch/
 ├── main/
-│   ├── app_main.c      # 硬件初始化：SPI 总线、GC9A01 面板、LVGL 移植、背光
+│   ├── app_main.c      # 硬件初始化：SPI、GC9A01、GRAM 清零、LVGL 移植、背光
 │   ├── clock.c/.h      # 走时模块（软件计时，预留 RTC 接口）
-│   ├── watch_face.c/.h # 表盘 UI：刻度、数字、指针、日期
+│   ├── watch_face.c/.h # 表盘页：刻度、数字、指针、日期
+│   ├── info_page.c/.h  # 系统信息页：运行时长、屏幕、SPI 时钟
+│   ├── pages.c/.h      # 页面容器与切换，隐藏页暂停刷新
+│   ├── button.c/.h     # BOOT 键扫描、消抖、短按/长按识别
 │   └── CMakeLists.txt
 ├── CMakeLists.txt
 ├── sdkconfig.defaults  # GC9A01、16MB Flash、USB 控制台等关键配置
@@ -106,9 +121,15 @@ smart-watch/
    它只在 sdkconfig 首次生成时生效。改完默认值必须删掉 sdkconfig 重新
    `set-target`，配置才会真正应用。
 
-5. **杜邦线跑 20MHz SPI 会在屏幕左边缘产生误码竖纹**
-   已排除坐标偏移（`esp_lcd_gc9a01` 的 `x_gap`/`y_gap` 默认为 0）。
-   解决方向：降 pclk、缩短 SCLK/MOSI、信号线与 GND 双绞。
+5. **屏幕左边缘固定竖带，降 SPI 时钟无效**
+   一开始怀疑杜邦线信号完整性，把 pclk 从 20MHz 一路降到 5MHz，竖纹仍在 —— 该判断被证伪。
+   查 `esp_lcd_gc9a01` 源码发现：`mirror()` 只改 MADCTL 的 MX 位，**不改变 CASET 列窗口**，
+   而 `draw_bitmap()` 的 `x_gap` 默认为 0。因此 `mirror_x=true` 时物理左边缘对应显存最后一列；
+   该列若上电后从未被写入，GRAM 的随机内容就表现为一条位置固定的竖带。
+   LVGL 只重绘脏矩形，不会主动覆盖它。
+   **处理**：在 `disp_on_off(true)` 之后、开背光之前，分块把整块 GRAM 写黑
+   （`PANEL_CLEAR_GRAM_ON_BOOT`，置 0 可复现对比）；若仍存在，
+   把 `PANEL_MIRROR_X` 改成 0 观察竖纹是否换边，再用 `esp_lcd_panel_set_gap()` 微调列偏移。
 
 6. **供电链路**
    TP4056 输出只有 3.7V，直接灌进开发板 5V 脚的话 AMS1117 压差不足，
@@ -118,11 +139,13 @@ smart-watch/
 
 - [x] 点亮屏幕，跑通 SPI + GC9A01 + LVGL 全链路
 - [x] 指针式模拟表盘（刻度 + 数字 + 指针 + 日期）
+- [x] BOOT 键输入 + 双页面切换 + 隐藏页暂停刷新
+- [ ] 长按息屏、深度睡眠唤醒、RTC 内存保持走时
 - [ ] 演示 gif
 - [ ] 功耗实测（深度睡眠电流 / 峰值电流 / 续航）
 - [ ] DS3231 RTC，实现断电走时
 - [ ] 电池 + 升压供电，脱离 USB
-- [ ] 多页面滑动切换（表盘 / 计步 / 设置）
+- [ ] 扩展更多页面（计步 / 设置），沿用现有页面管理
 - [ ] 启用 8MB OPI PSRAM
 - [ ] 3D 打印外壳
 
